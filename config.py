@@ -21,6 +21,7 @@ FLASK_PORT: int = int(os.getenv("FLASK_PORT", "5000"))
 # MySQL Database
 # ==========================================
 DB_HOST: str = os.getenv("DB_HOST", "localhost")
+DB_PORT: int = int(os.getenv("DB_PORT", "3306"))
 DB_USER: str = os.getenv("DB_USER", "root")
 DB_PASSWORD: str = os.getenv("DB_PASSWORD", "")
 DB_NAME: str = os.getenv("DB_NAME", "rag_db")
@@ -32,6 +33,7 @@ DB_POOL_NAME: str = "rag_pool"
 # Confirms which DB values are actually loaded at runtime.
 # ------------------------------------------------------------------
 print("DEBUG DB_HOST    =", DB_HOST)
+print("DEBUG DB_PORT    =", DB_PORT)
 print("DEBUG DB_USER    =", DB_USER)
 print("DEBUG DB_NAME    =", DB_NAME)
 print("DEBUG FLASK_PORT =", FLASK_PORT)

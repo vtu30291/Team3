@@ -24,6 +24,7 @@ def ensure_database_exists():
     try:
         conn = mysql.connector.connect(
             host=config.DB_HOST,
+            port=config.DB_PORT,
             user=config.DB_USER,
             password=config.DB_PASSWORD,
         )
@@ -49,6 +50,7 @@ def init_db():
             pool_size=config.DB_POOL_SIZE,
             pool_reset_session=True,
             host=config.DB_HOST,
+            port=config.DB_PORT,
             user=config.DB_USER,
             password=config.DB_PASSWORD,
             database=config.DB_NAME,
