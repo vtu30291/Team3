@@ -1,0 +1,37 @@
+services:
+  - type: psvc
+    name: team3-db
+    runtime: image
+    image: mysql:8.0
+    envVars:
+      - key: MYSQL_DATABASE
+        value: rag_db
+      - key: MYSQL_ROOT_PASSWORD
+        value: rootpassword
+    disk:
+      name: team3-db-disk
+      mountPath: /var/lib/mysql
+      sizeGB: 1
+
+  - type: web
+    name: team3-backend
+    runtime: docker
+    envVars:
+      - key: DB_HOST
+        value: team3-db
+      - key: DB_USER
+        value: root
+      - key: DB_PASSWORD
+        value: rootpassword
+      - key: DB_NAME
+        value: rag_db
+      - key: FLASK_PORT
+        value: 10000
+      - key: OLLAMA_BASE_URL
+        value: http://localhost:11434
+      - key: STORAGE_DIR
+        value: /app/storage
+    disk:
+      name: team3-storage-disk
+      mountPath: /app/storage
+      sizeGB: 1

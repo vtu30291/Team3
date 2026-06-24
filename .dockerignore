@@ -1,0 +1,17 @@
+.venv
+.venv_old
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.git
+.gitignore
+.vscode
+.pytest_cache
+storage
+storage_test
+test_storage
+server_stdout.log
+server_stderr.log
+*.faiss
+*.pdf
