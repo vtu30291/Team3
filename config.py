@@ -7,7 +7,9 @@ Modules should import from this file instead of calling os.getenv() directly.
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+# override=False means real environment variables (e.g. set by Render) always win.
+# A .env file will only fill in values that are NOT already set in the environment.
+load_dotenv(override=False)
 
 
 # ==========================================
@@ -24,6 +26,15 @@ DB_PASSWORD: str = os.getenv("DB_PASSWORD", "")
 DB_NAME: str = os.getenv("DB_NAME", "rag_db")
 DB_POOL_SIZE: int = int(os.getenv("DB_POOL_SIZE", "10"))
 DB_POOL_NAME: str = "rag_pool"
+
+# ------------------------------------------------------------------
+# Startup diagnostic — visible in Render log stream on every deploy.
+# Confirms which DB values are actually loaded at runtime.
+# ------------------------------------------------------------------
+print("DEBUG DB_HOST    =", DB_HOST)
+print("DEBUG DB_USER    =", DB_USER)
+print("DEBUG DB_NAME    =", DB_NAME)
+print("DEBUG FLASK_PORT =", FLASK_PORT)
 
 # ==========================================
 # Ollama LLM

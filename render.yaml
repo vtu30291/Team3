@@ -1,34 +1,36 @@
+# -----------------------------------------------------------------------
+# render.yaml — Render deployment configuration for Team 3 RAG backend
+#
+# IMPORTANT NOTES FOR MYSQL ON RAILWAY:
+#   - mysql.railway.internal is only reachable from WITHIN Railway's
+#     private network. It is NOT accessible from Render.
+#   - You MUST use the Railway PUBLIC TCP hostname instead.
+#   - In Railway dashboard: your MySQL service → Settings → Networking
+#     → "Public Networking" section → copy the TCP Host and Port.
+#   - Set DB_HOST to that public hostname (e.g. roundhouse.proxy.rlwy.net)
+#   - Set DB_PORT to the corresponding public port (e.g. 12345)
+#   - Override these values in the Render dashboard, NOT here.
+# -----------------------------------------------------------------------
 services:
-  - type: psvc
-    name: team3-db
-    runtime: image
-    image: mysql:8.0
-    envVars:
-      - key: MYSQL_DATABASE
-        value: rag_db
-      - key: MYSQL_ROOT_PASSWORD
-        value: rootpassword
-    disk:
-      name: team3-db-disk
-      mountPath: /var/lib/mysql
-      sizeGB: 1
-
   - type: web
     name: team3-backend
     runtime: docker
     envVars:
+      # DB_HOST must be the Railway PUBLIC TCP hostname (not .railway.internal)
+      # Override this in the Render dashboard with your actual Railway public host.
       - key: DB_HOST
-        value: team3-db
+        value: REPLACE_WITH_RAILWAY_PUBLIC_TCP_HOST
       - key: DB_USER
         value: root
       - key: DB_PASSWORD
         value: rootpassword
       - key: DB_NAME
-        value: rag_db
+        value: railway
       - key: FLASK_PORT
         value: 10000
+      # Set this to your ngrok URL in the Render dashboard
       - key: OLLAMA_BASE_URL
-        value: http://localhost:11434
+        value: REPLACE_WITH_YOUR_NGROK_URL
       - key: STORAGE_DIR
         value: /app/storage
     disk:

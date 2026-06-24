@@ -15,3 +15,7 @@ server_stdout.log
 server_stderr.log
 *.faiss
 *.pdf
+# Never bake secrets into the image — Render injects these as env vars at runtime
+.env
+.env.*
+!.env.example
