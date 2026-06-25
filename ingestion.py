@@ -3,14 +3,9 @@ Document ingestion pipeline: PDF extraction, token-based chunking,
 embedding generation, MySQL storage, and FAISS index insertion.
 Runs in background threads to avoid blocking Flask request handlers.
 
-Memory-optimised for Render free-tier (512 MB hard limit):
-  - Embeddings are generated ONE chunk at a time (batch_size=1).
-  - normalize_embeddings=True inside encode() so vectors come out
-    pre-normalised; no duplicate normalisation buffer needed.
-  - torch.no_grad() prevents PyTorch from allocating gradient buffers.
-  - Every large object is deleted and gc.collect() is called immediately
-    after it is no longer needed.
-  - Only one SentenceTransformer singleton is kept in memory at any time.
+This version adds psutil RSS memory logging before and after every
+major operation so that Render logs identify the exact operation that
+crosses the 512 MB limit.
 """
 
 import gc
@@ -30,6 +25,30 @@ _model = None
 _model_lock = threading.Lock()
 
 
+# ------------------------------------------------------------------ #
+# Memory instrumentation helper
+# ------------------------------------------------------------------ #
+try:
+    import psutil as _psutil
+    _PROC = _psutil.Process(os.getpid())
+
+    def _mem() -> float:
+        """Return current RSS memory usage in MB."""
+        return _PROC.memory_info().rss / 1024 / 1024
+
+except ImportError:
+    def _mem() -> float:
+        return -1.0  # psutil not available; sentinel value
+
+
+def _log_mem(label: str):
+    """Emit a standardised RSS log line that is easy to grep in Render."""
+    logger.info(f"[MEM] {label}: {_mem():.1f} MB RSS")
+
+
+# ------------------------------------------------------------------ #
+# Embedding model (singleton)
+# ------------------------------------------------------------------ #
 def get_embedding_model():
     """
     Lazy-load and cache the SentenceTransformer model (thread-safe singleton).
@@ -38,17 +57,21 @@ def get_embedding_model():
     global _model
     with _model_lock:
         if _model is None:
+            _log_mem("Before SentenceTransformer load")
             logger.info(
                 f"Loading SentenceTransformer model '{config.EMBEDDING_MODEL_NAME}'..."
             )
             os.environ["HF_HUB_OFFLINE"] = "1"
             from sentence_transformers import SentenceTransformer
-
             _model = SentenceTransformer(config.EMBEDDING_MODEL_NAME)
+            _log_mem("After SentenceTransformer load")
             logger.info("SentenceTransformer model loaded successfully.")
         return _model
 
 
+# ------------------------------------------------------------------ #
+# PDF extraction
+# ------------------------------------------------------------------ #
 def extract_text_from_pdf(pdf_path: str) -> str:
     """
     Extract text from a PDF using PyMuPDF.
@@ -59,6 +82,7 @@ def extract_text_from_pdf(pdf_path: str) -> str:
 
     import fitz  # PyMuPDF
 
+    _log_mem("Before PDF extraction")
     doc = fitz.open(pdf_path)
     text = ""
     for page in doc:
@@ -66,9 +90,13 @@ def extract_text_from_pdf(pdf_path: str) -> str:
     doc.close()
     del doc
     gc.collect()
+    _log_mem("After PDF extraction")
     return text
 
 
+# ------------------------------------------------------------------ #
+# Chunking
+# ------------------------------------------------------------------ #
 def semantic_chunking(
     text: str,
     chunk_size: int = config.CHUNK_SIZE,
@@ -81,7 +109,10 @@ def semantic_chunking(
     model = get_embedding_model()
     tokenizer = model.tokenizer
 
+    _log_mem("Before tokenizer.encode (chunking)")
     tokens = tokenizer.encode(text, add_special_tokens=False)
+    _log_mem("After tokenizer.encode (chunking)")
+
     if not tokens:
         return []
 
@@ -108,19 +139,22 @@ def semantic_chunking(
 
     del tokens
     gc.collect()
+    _log_mem("After chunking complete (tokens freed)")
     return chunks
 
 
+# ------------------------------------------------------------------ #
+# Single-chunk encoder
+# ------------------------------------------------------------------ #
 def _encode_one(model, text: str) -> np.ndarray:
     """
-    Encode a single chunk of text under torch.no_grad().
+    Encode a single chunk of text.
 
-    - batch_size=1        : SentenceTransformer processes exactly one sentence
-                            internally — minimum possible tensor allocation.
-    - normalize_embeddings: vectors come out already L2-normalised so no
-                            duplicate normalisation buffer is required.
-    - convert_to_numpy    : avoids keeping a live PyTorch tensor in memory.
-    - show_progress_bar   : disabled to prevent tqdm buffering.
+    - batch_size=1         : one sentence at a time inside SentenceTransformer
+    - convert_to_tensor=False: returns a plain NumPy array, no live Tensor kept
+    - normalize_embeddings : L2-normalise inside encode() — no extra buffer needed
+    - show_progress_bar    : off — prevents tqdm buffering overhead
+    - torch.no_grad()      : suppresses gradient buffer allocation
     """
     try:
         import torch
@@ -128,40 +162,45 @@ def _encode_one(model, text: str) -> np.ndarray:
             vec = model.encode(
                 [text],
                 batch_size=1,
-                convert_to_numpy=True,
+                convert_to_tensor=False,
                 normalize_embeddings=True,
                 show_progress_bar=False,
             )
     except ImportError:
-        # Fallback if torch is not directly importable
         vec = model.encode(
             [text],
             batch_size=1,
-            convert_to_numpy=True,
+            convert_to_tensor=False,
             normalize_embeddings=True,
             show_progress_bar=False,
         )
     return np.array(vec, dtype="float32")
 
 
+# ------------------------------------------------------------------ #
+# Main ingestion function
+# ------------------------------------------------------------------ #
 def process_document_ingestion(
     material_id: str, file_path: str, vector_store: VectorStoreManager
 ):
     """
-    Ingests a PDF document in a memory-efficient one-chunk-at-a-time fashion:
+    Ingests a PDF document with full psutil RSS memory instrumentation.
 
-      STEP 1  Extract text from PDF → free PDF object
-      STEP 2  Chunk text → free raw text string
-      STEP 3  For each chunk (one at a time):
-                START  → open DB connection, acquire FAISS ID lock
-                BATCH  → encode (batch_size=1, no_grad), insert row, write FAISS, free
-                COMPLETE → all chunks done
-      STEP 4  UPDATE materials: status='active', chunk_count, index_id
-      STEP 5  Commit transaction
-      STEP 6  Post-commit SELECT verification
+    Memory is logged before and after:
+      - SentenceTransformer load
+      - PDF extraction
+      - Chunk generation
+      - Every encode() call
+      - Every FAISS add_vectors_deferred() call
+      - Every MySQL INSERT
+      - Before and after conn.commit()
 
-    Full traceback is logged at every failure point.
+    Key optimisation vs previous versions:
+      FAISS save_index() is called ONCE after all vectors are inserted,
+      not after every single chunk. This avoids N full index serialisations
+      (each of which allocates a write buffer proportional to index size).
     """
+    _log_mem("INGESTION START")
     logger.info(
         f"[INGESTION START] material_id={material_id} | file_path={file_path}"
     )
@@ -171,7 +210,7 @@ def process_document_ingestion(
     # ------------------------------------------------------------------ #
     try:
         logger.info(f"[STEP 1] Extracting text from PDF for material {material_id}")
-        text = extract_text_from_pdf(file_path)
+        text = extract_text_from_pdf(file_path)   # logs mem inside
         if not text.strip():
             raise ValueError("No text could be extracted from the PDF file.")
         logger.info(
@@ -190,10 +229,11 @@ def process_document_ingestion(
     # ------------------------------------------------------------------ #
     try:
         logger.info(f"[STEP 2] Running semantic chunking for material {material_id}")
-        chunks = semantic_chunking(text)
-        # Free the large raw text string — chunks contain everything needed.
+        _log_mem("Before semantic_chunking()")
+        chunks = semantic_chunking(text)       # logs mem inside
         del text
         gc.collect()
+        _log_mem("After del text + gc.collect()")
         if not chunks:
             raise ValueError("Document was empty or generated zero chunks.")
         total_chunks = len(chunks)
@@ -209,22 +249,25 @@ def process_document_ingestion(
         return
 
     # ------------------------------------------------------------------ #
-    # STEP 3: Open DB, lock, then encode + insert + FAISS one chunk at a time
+    # STEP 3: Open DB, lock, encode + insert + FAISS (deferred save) per chunk
     # ------------------------------------------------------------------ #
     conn = None
     cursor = None
     start_id = None
 
     try:
-        logger.info(f"[STEP 3 START] Beginning embedding loop for material {material_id} "
-                    f"({total_chunks} chunks, batch_size=1)")
+        logger.info(
+            f"[STEP 3 START] Beginning embedding loop for material {material_id} "
+            f"({total_chunks} chunks, batch_size=1, deferred FAISS save)"
+        )
+        _log_mem("STEP 3 START")
 
-        # --- Open connection and begin explicit transaction ---
+        # Open connection and begin explicit transaction
         conn = get_db_connection()
         conn.autocommit = False
         cursor = conn.cursor()
 
-        # --- Acquire row-level lock and compute FAISS start ID ---
+        # Acquire row-level lock and compute FAISS start ID
         cursor.execute("SELECT COALESCE(MAX(id), 0) FROM chunks FOR UPDATE")
         row = cursor.fetchone()
         start_id = row[0] + 1
@@ -245,16 +288,18 @@ def process_document_ingestion(
 
             logger.info(
                 f"[STEP 3 BATCH {chunk_idx + 1}/{total_chunks}] "
-                f"Encoding chunk (faiss_id={faiss_id}) for material {material_id}"
+                f"faiss_id={faiss_id} for material {material_id}"
             )
 
-            # 3a: Encode single chunk — batch_size=1, no_grad, normalized
+            # 3a: Encode — measure before + after
+            _log_mem(f"STEP 3 BATCH {chunk_idx + 1} before encode()")
             try:
                 batch_embeddings = _encode_one(model, chunk_text)
             except Exception:
                 logger.exception(
-                    f"[STEP 3 FAILED] Encoding failed at chunk {chunk_idx + 1}/{total_chunks} "
-                    f"for material {material_id}.\n" + traceback.format_exc()
+                    f"[STEP 3 FAILED] encode() failed at chunk "
+                    f"{chunk_idx + 1}/{total_chunks} for material {material_id}.\n"
+                    + traceback.format_exc()
                 )
                 try:
                     conn.rollback()
@@ -262,14 +307,20 @@ def process_document_ingestion(
                     pass
                 _mark_inactive(material_id)
                 return
+            _log_mem(f"STEP 3 BATCH {chunk_idx + 1} after encode()")
 
-            # 3b: Insert this chunk row into MySQL
+            # 3b: MySQL INSERT — measure before + after
+            _log_mem(f"STEP 3 BATCH {chunk_idx + 1} before MySQL INSERT")
             try:
-                cursor.execute(insert_query, (material_id, chunk_idx, chunk_text, faiss_id))
+                cursor.execute(
+                    insert_query,
+                    (material_id, chunk_idx, chunk_text, faiss_id),
+                )
             except Exception:
                 logger.exception(
-                    f"[STEP 3 FAILED] MySQL insert failed at chunk {chunk_idx + 1}/{total_chunks} "
-                    f"for material {material_id}.\n" + traceback.format_exc()
+                    f"[STEP 3 FAILED] MySQL INSERT failed at chunk "
+                    f"{chunk_idx + 1}/{total_chunks} for material {material_id}.\n"
+                    + traceback.format_exc()
                 )
                 del batch_embeddings
                 gc.collect()
@@ -279,15 +330,18 @@ def process_document_ingestion(
                     pass
                 _mark_inactive(material_id)
                 return
+            _log_mem(f"STEP 3 BATCH {chunk_idx + 1} after MySQL INSERT")
 
-            # 3c: Write this single vector to FAISS immediately
+            # 3c: FAISS add_vectors_deferred (NO disk write yet) — measure before + after
+            _log_mem(f"STEP 3 BATCH {chunk_idx + 1} before FAISS add_vectors_deferred()")
             try:
                 faiss_ids_arr = np.array([faiss_id], dtype=np.int64)
-                vector_store.add_vectors(batch_embeddings, faiss_ids_arr)
+                vector_store.add_vectors_deferred(batch_embeddings, faiss_ids_arr)
             except Exception:
                 logger.exception(
-                    f"[STEP 3 FAILED] FAISS write failed at chunk {chunk_idx + 1}/{total_chunks} "
-                    f"for material {material_id}.\n" + traceback.format_exc()
+                    f"[STEP 3 FAILED] FAISS add_vectors_deferred() failed at chunk "
+                    f"{chunk_idx + 1}/{total_chunks} for material {material_id}.\n"
+                    + traceback.format_exc()
                 )
                 del batch_embeddings, faiss_ids_arr
                 gc.collect()
@@ -297,12 +351,30 @@ def process_document_ingestion(
                     pass
                 _mark_inactive(material_id)
                 return
+            _log_mem(f"STEP 3 BATCH {chunk_idx + 1} after FAISS add_vectors_deferred()")
 
-            # 3d: Free this batch's memory before moving to next chunk
+            # 3d: Free this batch's memory before next iteration
             del batch_embeddings, faiss_ids_arr, chunk_text
             gc.collect()
 
-        # All chunks processed — free the chunks list
+        # All chunks done — flush FAISS index to disk ONCE
+        _log_mem("Before FAISS save_index() (single flush after all vectors)")
+        try:
+            vector_store.flush_index()
+        except Exception:
+            logger.exception(
+                f"[STEP 3 FAILED] FAISS flush_index() failed for material {material_id}.\n"
+                + traceback.format_exc()
+            )
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            _mark_inactive(material_id)
+            return
+        _log_mem("After FAISS save_index()")
+
+        # Free the chunks list
         del chunks
         gc.collect()
 
@@ -310,6 +382,7 @@ def process_document_ingestion(
             f"[STEP 3 COMPLETE] All {total_chunks} chunks encoded and written to FAISS "
             f"for material {material_id}. Index total: {vector_store.get_total_vectors()}"
         )
+        _log_mem("STEP 3 COMPLETE")
 
     except Exception:
         logger.exception(
@@ -364,8 +437,10 @@ def process_document_ingestion(
     # STEP 5: Commit the transaction
     # ------------------------------------------------------------------ #
     try:
+        _log_mem("Before conn.commit()")
         logger.info(f"[STEP 5] Committing transaction for material {material_id}")
         conn.commit()
+        _log_mem("After conn.commit()")
         logger.info(
             f"[STEP 5 OK] Transaction committed successfully for material {material_id}"
         )
@@ -420,11 +495,15 @@ def process_document_ingestion(
             + traceback.format_exc()
         )
 
+    _log_mem("INGESTION COMPLETE")
     logger.info(
         f"[INGESTION COMPLETE] material_id={material_id} successfully activated."
     )
 
 
+# ------------------------------------------------------------------ #
+# Error recovery helper
+# ------------------------------------------------------------------ #
 def _mark_inactive(material_id: str):
     """
     Marks the material as 'inactive' after a pipeline failure.
@@ -454,6 +533,9 @@ def _mark_inactive(material_id: str):
         )
 
 
+# ------------------------------------------------------------------ #
+# Thread launcher
+# ------------------------------------------------------------------ #
 def start_async_ingestion(
     material_id: str, file_path: str, vector_store: VectorStoreManager
 ):

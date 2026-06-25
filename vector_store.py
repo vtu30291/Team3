@@ -69,7 +69,11 @@ class VectorStoreManager:
             raise
 
     def add_vectors(self, embeddings: np.ndarray, ids: np.ndarray):
-        """Add L2-normalized embeddings to the index with specific integer IDs."""
+        """Add L2-normalized embeddings to the index with specific integer IDs.
+        Saves the FAISS index to disk immediately after insertion.
+        Use add_vectors_deferred() + flush_index() when ingesting many chunks
+        to avoid repeated full-index serialisations.
+        """
         if embeddings.shape[1] != config.EMBEDDING_DIMENSION:
             raise ValueError(
                 f"Embeddings dimension must be {config.EMBEDDING_DIMENSION}, "
@@ -85,6 +89,33 @@ class VectorStoreManager:
         with self.lock:
             assert self.index is not None
             self.index.add_with_ids(embeddings, ids)
+            self.save_index()
+
+    def add_vectors_deferred(self, embeddings: np.ndarray, ids: np.ndarray):
+        """Add embeddings to the in-memory index WITHOUT writing to disk.
+        Call flush_index() once after all batches are inserted to persist.
+        This avoids N full-index serialisations when ingesting N chunks.
+        """
+        if embeddings.shape[1] != config.EMBEDDING_DIMENSION:
+            raise ValueError(
+                f"Embeddings dimension must be {config.EMBEDDING_DIMENSION}, "
+                f"got {embeddings.shape[1]}"
+            )
+
+        embeddings = embeddings.astype("float32").copy()
+        faiss.normalize_L2(embeddings)
+        ids = np.array(ids, dtype=np.int64)
+
+        with self.lock:
+            assert self.index is not None
+            self.index.add_with_ids(embeddings, ids)
+            # No save_index() here — caller must call flush_index() when done.
+
+    def flush_index(self):
+        """Persist the current in-memory FAISS index to disk.
+        Call this once after all add_vectors_deferred() calls are complete.
+        """
+        with self.lock:
             self.save_index()
 
     def remove_vectors(self, ids: np.ndarray | list):
